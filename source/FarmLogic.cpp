@@ -204,29 +204,45 @@ void FarmLogic::chickenThread(int chickenId) {
             int newY = chicken.y + dy;
 
             bool moved = false;
-            
-            // Try to move; if blocked, try just x or just y movement
-            if (canMoveToPosition(newX, newY, chicken.width, chicken.height, chicken.id)) {
-                chicken.setPos(newX, newY);
+
+            auto tryMove = [&](int moveX, int moveY) {
+                if (moveX == 0 && moveY == 0) {
+                    return false;
+                }
+
+                int candidateX = chicken.x + moveX;
+                int candidateY = chicken.y + moveY;
+
+                if (candidateX < 30 || candidateX > 770 || candidateY < 30 || candidateY > 570) {
+                    return false;
+                }
+
+                if (!canMoveToPosition(candidateX, candidateY, chicken.width, chicken.height, chicken.id)) {
+                    return false;
+                }
+
+                chicken.setPos(candidateX, candidateY);
                 {
                     std::lock_guard<std::mutex> lock(_farmDisplayMutex);
                     chicken.updateFarm();
                 }
-                moved = true;
-            } else if (dx != 0 && canMoveToPosition(chicken.x + dx, chicken.y, chicken.width, chicken.height, chicken.id)) {
-                chicken.setPos(chicken.x + dx, chicken.y);
-                {
-                    std::lock_guard<std::mutex> lock(_farmDisplayMutex);
-                    chicken.updateFarm();
+                return true;
+            };
+
+            std::array<std::pair<int, int>, 8> candidateMoves = {std::make_pair(dx, dy),
+                                                                  std::make_pair(dx, 0),
+                                                                  std::make_pair(0, dy),
+                                                                  std::make_pair(dx, (dy == 0 ? normalStep : dy)),
+                                                                  std::make_pair(dx, (dy == 0 ? -normalStep : -dy)),
+                                                                  std::make_pair(0, (dy >= 0 ? normalStep : -normalStep)),
+                                                                  std::make_pair(0, (dy >= 0 ? 2 * normalStep : -2 * normalStep)),
+                                                                  std::make_pair((dx >= 0 ? normalStep : -normalStep), dy)};
+
+            for (const auto& move : candidateMoves) {
+                if (tryMove(move.first, move.second)) {
+                    moved = true;
+                    break;
                 }
-                moved = true;
-            } else if (dy != 0 && canMoveToPosition(chicken.x, chicken.y + dy, chicken.width, chicken.height, chicken.id)) {
-                chicken.setPos(chicken.x, chicken.y + dy);
-                {
-                    std::lock_guard<std::mutex> lock(_farmDisplayMutex);
-                    chicken.updateFarm();
-                }
-                moved = true;
             }
 
             if (!moved) {
@@ -400,12 +416,13 @@ void FarmLogic::farmerThread() {
     int collectionsCount = 0;
     bool isCollided = false;
     int collisionTurnsRemaining = 0;
-    
+
     while (_running) {
         std::this_thread::sleep_for(std::chrono::milliseconds(3000));
-        
+
         // Visit each nest
-        for (int nestIdx = 0; nestIdx < 3; nestIdx++) {
+        bool quotaMet = false;
+        for (int nestIdx = 0; nestIdx < 3 && !quotaMet; nestIdx++) {
             // Walk to nest
             int targetX = NEST_POSITIONS[nestIdx][0];
             int targetY = NEST_POSITIONS[nestIdx][1] - 50;
@@ -504,12 +521,15 @@ void FarmLogic::farmerThread() {
                 }
                 _nestEggCounts[nestIdx] = 0;
                 collectionsCount++;
+                if (collectionsCount >= 3) {
+                    quotaMet = true;
+                }
             }
-            
+
             nestLock.unlock();
             _nestCVs[nestIdx].notify_all();
         }
-        
+
         // After 3 collections, drop off eggs at barn
         if (collectionsCount >= 3) {
             // Walk to barn1 (egg barn)
