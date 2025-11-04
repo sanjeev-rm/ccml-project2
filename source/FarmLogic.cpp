@@ -6,7 +6,10 @@
 #include <ctime>
 #include <chrono>
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <random>
+#include <utility>
 
 // Initialize static members
 std::mutex FarmLogic::_farmDisplayMutex;
@@ -17,6 +20,8 @@ std::mutex FarmLogic::_nestMutexes[3];
 std::condition_variable FarmLogic::_nestCVs[3];
 int FarmLogic::_nestEggCounts[3] = {0, 0, 0};
 bool FarmLogic::_chickenOnNest[3] = {false, false, false};
+std::array<std::array<int, 3>, 3> FarmLogic::_nestEggIds = {{{0, 0, 0}, {0, 0, 0}, {0, 0, 0}}};
+std::atomic<int> FarmLogic::_nextEggId{1000};
 
 std::mutex FarmLogic::_bakeryStorageMutex;
 std::condition_variable FarmLogic::_bakeryStorageCV;
@@ -45,7 +50,8 @@ std::mutex FarmLogic::_positionMutex;
 std::mutex FarmLogic::_shopMutex;
 
 // Constants for positions
-const int NEST_POSITIONS[3][2] = {{150, 500}, {400, 500}, {650, 500}};
+const int NEST_POSITIONS[3][2] = {{300, 140}, {400, 80}, {500, 140}};
+const int CHICKEN_WAIT_POSITIONS[3][2] = {{400, 260}, {440, 300}, {360, 300}};
 const int BARN1_X = 100;
 const int BARN1_Y = 100;
 const int BARN2_X = 100;
@@ -54,6 +60,8 @@ const int BAKERY_X = 650;
 const int BAKERY_Y = 150;
 const int INTERSECTION_X = 400;
 const int INTERSECTION_Y = 200;
+const int FARMER_REST_X = BARN1_X;
+const int FARMER_REST_Y = BARN1_Y + 80;
 
 // Helper function to check collision between two rectangles
 bool FarmLogic::checkCollision(int x1, int y1, int w1, int h1, int x2, int y2, int w2, int h2) {
@@ -71,8 +79,8 @@ bool FarmLogic::canMoveToPosition(int x, int y, int width, int height, int myId)
     std::lock_guard<std::mutex> lock(_positionMutex);
     for (const auto& pair : DisplayObject::theFarm) {
         if (pair.second.id != myId && pair.second.layer == 2) {
-            if (checkCollision(x, y, width, height, 
-                             pair.second.x, pair.second.y, 
+            if (checkCollision(x, y, width, height,
+                             pair.second.x, pair.second.y,
                              pair.second.width, pair.second.height)) {
                 return false;
             }
@@ -81,215 +89,121 @@ bool FarmLogic::canMoveToPosition(int x, int y, int width, int height, int myId)
     return true;
 }
 
+void FarmLogic::moveEntity(DisplayObject& entity, int targetX, int targetY, int step, int delayMs) {
+    while (_running && entity.x != targetX) {
+        int diff = targetX - entity.x;
+        int delta = (std::abs(diff) < step) ? diff : (diff > 0 ? step : -step);
+        int newX = entity.x + delta;
+        if (canMoveToPosition(newX, entity.y, entity.width, entity.height, entity.id)) {
+            entity.setPos(newX, entity.y);
+            {
+                std::lock_guard<std::mutex> lock(_farmDisplayMutex);
+                entity.updateFarm();
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+    }
+
+    while (_running && entity.y != targetY) {
+        int diff = targetY - entity.y;
+        int delta = (std::abs(diff) < step) ? diff : (diff > 0 ? step : -step);
+        int newY = entity.y + delta;
+        if (canMoveToPosition(entity.x, newY, entity.width, entity.height, entity.id)) {
+            entity.setPos(entity.x, newY);
+            {
+                std::lock_guard<std::mutex> lock(_farmDisplayMutex);
+                entity.updateFarm();
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+    }
+}
+
 // Chicken thread - walks between nests and lays eggs
 void FarmLogic::chickenThread(int chickenId) {
-    std::random_device rd;
-    std::mt19937 gen(rd() + chickenId);
-    std::uniform_int_distribution<> nestDist(0, 2);
-    std::uniform_int_distribution<> eggDist(1, 2);
-    
     DisplayObject chicken("chicken", 60, 60, 2, 100 + chickenId);
-    chicken.setPos(200 + chickenId * 100, 0);
-    
+    int targetNest = chickenId % 3;
+    chicken.setPos(NEST_POSITIONS[targetNest][0], NEST_POSITIONS[targetNest][1]);
+
     {
         std::lock_guard<std::mutex> lock(_farmDisplayMutex);
         chicken.updateFarm();
     }
-    
-    int eggsLaidSinceMove = 0;
-    int currentNest = nestDist(gen);
-    
+
+    const int stepSize = 4;
+
     while (_running) {
-        // Determine target nest (must change after laying 3 eggs)
-        int targetNest = currentNest;
-        if (eggsLaidSinceMove >= 3) {
-            targetNest = (currentNest + 1 + nestDist(gen)) % 3;
-            eggsLaidSinceMove = 0;
-        }
-        
-        // Walk to nest
-        int targetX = NEST_POSITIONS[targetNest][0];
-        int targetY = NEST_POSITIONS[targetNest][1];
-        
-        int stuckCounter = 0;
-        int lastX = chicken.x;
-        int lastY = chicken.y;
-        
-        while (std::abs(chicken.x - targetX) > 5 || std::abs(chicken.y - targetY) > 5) {
-            int dx = (targetX > chicken.x) ? 3 : (targetX < chicken.x) ? -3 : 0;
-            int dy = (targetY > chicken.y) ? 3 : (targetY < chicken.y) ? -3 : 0;
-            
-            int newX = chicken.x + dx;
-            int newY = chicken.y + dy;
-            
-            bool moved = false;
-            
-            // Try to move; if blocked, try just x or just y movement
-            if (canMoveToPosition(newX, newY, chicken.width, chicken.height, chicken.id)) {
-                chicken.setPos(newX, newY);
-                {
-                    std::lock_guard<std::mutex> lock(_farmDisplayMutex);
-                    chicken.updateFarm();
-                }
-                moved = true;
-            } else if (dx != 0 && canMoveToPosition(chicken.x + dx, chicken.y, chicken.width, chicken.height, chicken.id)) {
-                chicken.setPos(chicken.x + dx, chicken.y);
-                {
-                    std::lock_guard<std::mutex> lock(_farmDisplayMutex);
-                    chicken.updateFarm();
-                }
-                moved = true;
-            } else if (dy != 0 && canMoveToPosition(chicken.x, chicken.y + dy, chicken.width, chicken.height, chicken.id)) {
-                chicken.setPos(chicken.x, chicken.y + dy);
-                {
-                    std::lock_guard<std::mutex> lock(_farmDisplayMutex);
-                    chicken.updateFarm();
-                }
-                moved = true;
+        {
+            std::unique_lock<std::mutex> nestLock(_nestMutexes[targetNest]);
+            _nestCVs[targetNest].wait(nestLock, [&]() {
+                return !_running || (_nestEggCounts[targetNest] == 0 && !_chickenOnNest[targetNest]);
+            });
+            if (!_running) {
+                break;
             }
-            
-            // Detect if stuck and add random offset to break deadlock
-            if (!moved || (chicken.x == lastX && chicken.y == lastY)) {
-                stuckCounter++;
-                if (stuckCounter > 10) {
-                    // Move to a random nearby position to break deadlock
-                    int randomOffsetX = (gen() % 40) - 20;
-                    int randomOffsetY = (gen() % 40) - 20;
-                    int escapeX = chicken.x + randomOffsetX;
-                    int escapeY = chicken.y + randomOffsetY;
-                    
-                    if (canMoveToPosition(escapeX, escapeY, chicken.width, chicken.height, chicken.id)) {
-                        chicken.setPos(escapeX, escapeY);
-                        {
-                            std::lock_guard<std::mutex> lock(_farmDisplayMutex);
-                            chicken.updateFarm();
-                        }
-                    }
-                    stuckCounter = 0;
-                }
-            } else {
-                stuckCounter = 0;
-            }
-            
-            lastX = chicken.x;
-            lastY = chicken.y;
-            
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            _chickenOnNest[targetNest] = true;
         }
-        
-        currentNest = targetNest;
-        
-        // Check if nest is available (NO WAITING - immediate check)
-        std::unique_lock<std::mutex> nestLock(_nestMutexes[currentNest]);
-        bool canLayEggs = (_nestEggCounts[currentNest] < 3 && !_chickenOnNest[currentNest]);
-        
-        // If nest is full or occupied, IMMEDIATELY MOVE TO DIFFERENT NEST
-        if (!canLayEggs) {
-            nestLock.unlock();
-            
-            // FORCE chicken to move FAR AWAY from this nest
-            int escapeX = chicken.x + ((gen() % 2) ? 80 : -80);
-            int escapeY = chicken.y + ((gen() % 2) ? 80 : -80);
-            
-            // Keep within bounds
-            escapeX = std::max(50, std::min(750, escapeX));
-            escapeY = std::max(50, std::min(550, escapeY));
-            
-            // Force move (try multiple times if needed)
-            for (int attempt = 0; attempt < 5; attempt++) {
-                if (canMoveToPosition(escapeX, escapeY, chicken.width, chicken.height, chicken.id)) {
-                    chicken.setPos(escapeX, escapeY);
-                    {
-                        std::lock_guard<std::mutex> lock(_farmDisplayMutex);
-                        chicken.updateFarm();
-                    }
-                    break;
-                }
-                escapeX += (gen() % 40) - 20;
-                escapeY += (gen() % 40) - 20;
-                escapeX = std::max(50, std::min(750, escapeX));
-                escapeY = std::max(50, std::min(550, escapeY));
-            }
-            
-            // Force select a DIFFERENT nest next time
-            currentNest = (currentNest + 1 + (gen() % 2)) % 3;
-            eggsLaidSinceMove = 0;
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            continue; // Skip to next iteration with different nest
-        }
-        
-        _chickenOnNest[currentNest] = true;
-        
-        int eggsToLay = std::min(eggDist(gen), 3 - _nestEggCounts[currentNest]);
-        
-        for (int i = 0; i < eggsToLay; i++) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            _nestEggCounts[currentNest]++;
-            eggsLaidSinceMove++;
-            
-            // Update barn eggs
+
+        moveEntity(chicken, NEST_POSITIONS[targetNest][0], NEST_POSITIONS[targetNest][1], stepSize, 60);
+
+        for (int eggIndex = 0; eggIndex < 3 && _running; ++eggIndex) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(400));
+            int eggId = _nextEggId.fetch_add(1);
+            DisplayObject egg("egg", 10, 20, 1, eggId);
+
+            int offsetX = (eggIndex - 1) * 15;
+            int offsetY = 25 + (eggIndex == 1 ? 6 : 0);
+            egg.setPos(NEST_POSITIONS[targetNest][0] + offsetX,
+                      NEST_POSITIONS[targetNest][1] + offsetY);
+
             {
-                std::lock_guard<std::mutex> barnLock(_barnEggMutex);
-                _barnEggs++;
-                DisplayObject::stats.eggs_laid++;
-                _barnEggCV.notify_all();
-            }
-            
-            // Display egg
-            DisplayObject egg("egg", 10, 20, 1, 200 + currentNest * 10 + _nestEggCounts[currentNest]);
-            egg.setPos(NEST_POSITIONS[currentNest][0] + (_nestEggCounts[currentNest] - 1) * 15 - 15, 
-                      NEST_POSITIONS[currentNest][1] + 7);
-            {
-                std::lock_guard<std::mutex> lock(_farmDisplayMutex);
+                std::lock_guard<std::mutex> displayLock(_farmDisplayMutex);
                 egg.updateFarm();
             }
-        }
-        
-        _chickenOnNest[currentNest] = false;
-        nestLock.unlock();
-        _nestCVs[currentNest].notify_all();
-        
-        // Random wandering after laying eggs - move away from nest
-        std::uniform_int_distribution<> wanderDist(5, 15);
-        int wanderSteps = wanderDist(gen);
-        
-        for (int step = 0; step < wanderSteps; step++) {
-            // Random direction
-            int randDx = (gen() % 7) - 3; // -3 to +3
-            int randDy = (gen() % 7) - 3;
-            
-            int newX = chicken.x + randDx * 5;
-            int newY = chicken.y + randDy * 5;
-            
-            // Keep within bounds
-            newX = std::max(30, std::min(770, newX));
-            newY = std::max(30, std::min(570, newY));
-            
-            if (canMoveToPosition(newX, newY, chicken.width, chicken.height, chicken.id)) {
-                chicken.setPos(newX, newY);
-                {
-                    std::lock_guard<std::mutex> lock(_farmDisplayMutex);
-                    chicken.updateFarm();
-                }
+
+            {
+                std::lock_guard<std::mutex> nestLock(_nestMutexes[targetNest]);
+                _nestEggIds[targetNest][eggIndex] = eggId;
+                _nestEggCounts[targetNest] = eggIndex + 1;
             }
-            
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+            {
+                std::lock_guard<std::mutex> statsLock(_barnEggMutex);
+                DisplayObject::stats.eggs_laid++;
+            }
         }
-        
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+        {
+            std::lock_guard<std::mutex> nestLock(_nestMutexes[targetNest]);
+            _nestCVs[targetNest].notify_all();
+        }
+
+        moveEntity(chicken,
+                   CHICKEN_WAIT_POSITIONS[chickenId][0],
+                   CHICKEN_WAIT_POSITIONS[chickenId][1],
+                   stepSize,
+                   60);
+
+        {
+            std::lock_guard<std::mutex> nestLock(_nestMutexes[targetNest]);
+            _chickenOnNest[targetNest] = false;
+        }
+        _nestCVs[targetNest].notify_all();
+
+        targetNest = (targetNest + 1) % 3;
     }
 }
 
 // Cow thread - just stands around
 void FarmLogic::cowThread(int cowId) {
     DisplayObject cow("cow", 60, 60, 2, 300 + cowId);
-    cow.setPos(250 + cowId * 80, 350);
-    
+    cow.setPos(700 + cowId * 40, 450);
+
     {
         std::lock_guard<std::mutex> lock(_farmDisplayMutex);
         cow.updateFarm();
     }
-    
+
     while (_running) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     }
@@ -297,214 +211,58 @@ void FarmLogic::cowThread(int cowId) {
 
 // Farmer thread - collects eggs from nests
 void FarmLogic::farmerThread() {
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    
     DisplayObject farmer("farmer", 30, 60, 2, 400);
-    farmer.setPos(200, 400);
-    
+    farmer.setPos(FARMER_REST_X, FARMER_REST_Y);
+
     {
         std::lock_guard<std::mutex> lock(_farmDisplayMutex);
         farmer.updateFarm();
     }
-    
-    int collectionsCount = 0;
-    bool isCollided = false;
-    int collisionTurnsRemaining = 0;
-    
+
+    const int stepSize = 4;
+
     while (_running) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(3000));
-        
-        // Visit each nest
-        for (int nestIdx = 0; nestIdx < 3; nestIdx++) {
-            // Walk to nest
-            int targetX = NEST_POSITIONS[nestIdx][0];
-            int targetY = NEST_POSITIONS[nestIdx][1] - 50;
-            
-            int lastX = farmer.x;
-            int lastY = farmer.y;
-            
-            while (std::abs(farmer.x - targetX) > 5 || std::abs(farmer.y - targetY) > 5) {
-                // If in collision mode, MOVE OUT OF THE WAY aggressively
-                if (isCollided && collisionTurnsRemaining > 0) {
-                    // Move to random position away from current location
-                    int escapeX = farmer.x + ((gen() % 2) ? 60 : -60);
-                    int escapeY = farmer.y + ((gen() % 2) ? 60 : -60);
-                    
-                    escapeX = std::max(50, std::min(750, escapeX));
-                    escapeY = std::max(50, std::min(550, escapeY));
-                    
-                    if (canMoveToPosition(escapeX, escapeY, farmer.width, farmer.height, farmer.id)) {
-                        farmer.setPos(escapeX, escapeY);
-                        {
-                            std::lock_guard<std::mutex> lock(_farmDisplayMutex);
-                            farmer.updateFarm();
-                        }
-                    }
-                    
-                    collisionTurnsRemaining--;
-                    if (collisionTurnsRemaining <= 0) {
-                        isCollided = false;
-                    }
-                    
-                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                    continue;
-                }
-                
-                int dx = (targetX > farmer.x) ? 3 : (targetX < farmer.x) ? -3 : 0;
-                int dy = (targetY > farmer.y) ? 3 : (targetY < farmer.y) ? -3 : 0;
-                
-                int newX = farmer.x + dx;
-                int newY = farmer.y + dy;
-                
-                bool moved = false;
-                
-                if (canMoveToPosition(newX, newY, farmer.width, farmer.height, farmer.id)) {
-                    farmer.setPos(newX, newY);
-                    {
-                        std::lock_guard<std::mutex> lock(_farmDisplayMutex);
-                        farmer.updateFarm();
-                    }
-                    moved = true;
-                } else if (dx != 0 && canMoveToPosition(farmer.x + dx, farmer.y, farmer.width, farmer.height, farmer.id)) {
-                    farmer.setPos(farmer.x + dx, farmer.y);
-                    {
-                        std::lock_guard<std::mutex> lock(_farmDisplayMutex);
-                        farmer.updateFarm();
-                    }
-                    moved = true;
-                } else if (dy != 0 && canMoveToPosition(farmer.x, farmer.y + dy, farmer.width, farmer.height, farmer.id)) {
-                    farmer.setPos(farmer.x, farmer.y + dy);
-                    {
-                        std::lock_guard<std::mutex> lock(_farmDisplayMutex);
-                        farmer.updateFarm();
-                    }
-                    moved = true;
-                } else {
-                    // COLLISION DETECTED - activate collision mode
-                    isCollided = true;
-                    collisionTurnsRemaining = 20;
-                }
-                
-                // Reset collision state if moving normally
-                if (moved && farmer.x != lastX && farmer.y != lastY) {
-                    isCollided = false;
-                    collisionTurnsRemaining = 0;
-                }
-                
-                lastX = farmer.x;
-                lastY = farmer.y;
-                
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            }
-            
-            // Collect eggs (wait for chicken to leave nest)
-            std::unique_lock<std::mutex> nestLock(_nestMutexes[nestIdx]);
-            _nestCVs[nestIdx].wait(nestLock, [nestIdx]() {
-                return !_chickenOnNest[nestIdx];
+        for (int nestIdx = 0; nestIdx < 3 && _running; ++nestIdx) {
+            std::unique_lock<std::mutex> waitLock(_nestMutexes[nestIdx]);
+            _nestCVs[nestIdx].wait(waitLock, [&]() {
+                return !_running || (_nestEggCounts[nestIdx] >= 3 && !_chickenOnNest[nestIdx]);
             });
-            
-            if (_nestEggCounts[nestIdx] > 0) {
-                // Remove eggs from display
-                for (int i = 0; i < _nestEggCounts[nestIdx]; i++) {
-                    DisplayObject egg("egg", 10, 20, 1, 200 + nestIdx * 10 + i + 1);
-                    {
-                        std::lock_guard<std::mutex> lock(_farmDisplayMutex);
-                        egg.erase();
-                    }
-                }
+            if (!_running) {
+                return;
+            }
+            waitLock.unlock();
+
+            moveEntity(farmer, NEST_POSITIONS[nestIdx][0], NEST_POSITIONS[nestIdx][1] - 70, stepSize, 60);
+
+            std::array<int, 3> eggsToCollect{};
+            {
+                std::lock_guard<std::mutex> collectLock(_nestMutexes[nestIdx]);
+                eggsToCollect = _nestEggIds[nestIdx];
                 _nestEggCounts[nestIdx] = 0;
-                collectionsCount++;
+                _nestEggIds[nestIdx].fill(0);
             }
-            
-            nestLock.unlock();
+
+            int collected = 0;
+            {
+                std::lock_guard<std::mutex> displayLock(_farmDisplayMutex);
+                for (int eggId : eggsToCollect) {
+                    if (eggId != 0) {
+                        DisplayObject::theFarm.erase(eggId);
+                        collected++;
+                    }
+                }
+                farmer.updateFarm();
+            }
+
+            if (collected > 0) {
+                std::lock_guard<std::mutex> barnLock(_barnEggMutex);
+                DisplayObject::stats.eggs_used += collected;
+            }
+
             _nestCVs[nestIdx].notify_all();
-        }
-        
-        // After 3 collections, drop off eggs at barn
-        if (collectionsCount >= 3) {
-            // Walk to barn1 (egg barn)
-            int targetX = BARN1_X;
-            int targetY = BARN1_Y - 50;
-            
-            int lastX = farmer.x;
-            int lastY = farmer.y;
-            
-            while (std::abs(farmer.x - targetX) > 5 || std::abs(farmer.y - targetY) > 5) {
-                // If in collision mode, MOVE OUT OF THE WAY
-                if (isCollided && collisionTurnsRemaining > 0) {
-                    int escapeX = farmer.x + ((gen() % 2) ? 60 : -60);
-                    int escapeY = farmer.y + ((gen() % 2) ? 60 : -60);
-                    
-                    escapeX = std::max(50, std::min(750, escapeX));
-                    escapeY = std::max(50, std::min(550, escapeY));
-                    
-                    if (canMoveToPosition(escapeX, escapeY, farmer.width, farmer.height, farmer.id)) {
-                        farmer.setPos(escapeX, escapeY);
-                        {
-                            std::lock_guard<std::mutex> lock(_farmDisplayMutex);
-                            farmer.updateFarm();
-                        }
-                    }
-                    
-                    collisionTurnsRemaining--;
-                    if (collisionTurnsRemaining <= 0) {
-                        isCollided = false;
-                    }
-                    
-                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                    continue;
-                }
-                
-                int dx = (targetX > farmer.x) ? 3 : (targetX < farmer.x) ? -3 : 0;
-                int dy = (targetY > farmer.y) ? 3 : (targetY < farmer.y) ? -3 : 0;
-                
-                int newX = farmer.x + dx;
-                int newY = farmer.y + dy;
-                
-                bool moved = false;
-                
-                if (canMoveToPosition(newX, newY, farmer.width, farmer.height, farmer.id)) {
-                    farmer.setPos(newX, newY);
-                    {
-                        std::lock_guard<std::mutex> lock(_farmDisplayMutex);
-                        farmer.updateFarm();
-                    }
-                    moved = true;
-                } else if (dx != 0 && canMoveToPosition(farmer.x + dx, farmer.y, farmer.width, farmer.height, farmer.id)) {
-                    farmer.setPos(farmer.x + dx, farmer.y);
-                    {
-                        std::lock_guard<std::mutex> lock(_farmDisplayMutex);
-                        farmer.updateFarm();
-                    }
-                    moved = true;
-                } else if (dy != 0 && canMoveToPosition(farmer.x, farmer.y + dy, farmer.width, farmer.height, farmer.id)) {
-                    farmer.setPos(farmer.x, farmer.y + dy);
-                    {
-                        std::lock_guard<std::mutex> lock(_farmDisplayMutex);
-                        farmer.updateFarm();
-                    }
-                    moved = true;
-                } else {
-                    // COLLISION DETECTED
-                    isCollided = true;
-                    collisionTurnsRemaining = 20;
-                }
-                
-                if (moved && farmer.x != lastX && farmer.y != lastY) {
-                    isCollided = false;
-                    collisionTurnsRemaining = 0;
-                }
-                
-                lastX = farmer.x;
-                lastY = farmer.y;
-                
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            }
-            
-            // Drop off eggs at barn (brief pause to simulate drop-off)
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            collectionsCount = 0;
+
+            moveEntity(farmer, FARMER_REST_X, FARMER_REST_Y, stepSize, 60);
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
     }
 }
@@ -834,6 +592,15 @@ void FarmLogic::redisplayThread() {
 void FarmLogic::run() {
     std::srand(std::time(0));
     _running = true;
+    _workers.clear();
+
+    for (int i = 0; i < 3; ++i) {
+        _nestEggCounts[i] = 0;
+        _chickenOnNest[i] = false;
+        _nestEggIds[i].fill(0);
+    }
+    _nextEggId.store(1000);
+    _barnEggs = 0;
     
     // Create static farm objects (layer 0 - stationary)
     DisplayObject barn1("barn", 100, 100, 0, 10);
@@ -881,20 +648,6 @@ void FarmLogic::run() {
     
     // Start farmer
     _workers.push_back(std::thread(farmerThread));
-    
-    // Start 2 trucks (one for eggs/butter, one for flour/sugar)
-    _workers.push_back(std::thread(truckThread, 0, true));  // Egg truck
-    _workers.push_back(std::thread(truckThread, 1, false)); // Flour/sugar truck
-    
-    // Start oven
-    _workers.push_back(std::thread(ovenThread));
-    
-    // Start 5 children
-    _workers.push_back(std::thread(childThread, 0));
-    _workers.push_back(std::thread(childThread, 1));
-    _workers.push_back(std::thread(childThread, 2));
-    _workers.push_back(std::thread(childThread, 3));
-    _workers.push_back(std::thread(childThread, 4));
     
     // Wait for all threads
     for (auto& worker : _workers) {

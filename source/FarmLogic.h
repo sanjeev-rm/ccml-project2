@@ -20,6 +20,8 @@ public:
     static std::condition_variable _nestCVs[3];
     static int _nestEggCounts[3];
     static bool _chickenOnNest[3];
+    static std::array<std::array<int, 3>, 3> _nestEggIds;
+    static std::atomic<int> _nextEggId;
     
     // Bakery storage synchronization
     static std::mutex _bakeryStorageMutex;
@@ -64,7 +66,8 @@ private:
     static void childThread(int childId);
     static void ovenThread();
     static void redisplayThread();
-    
+
     static bool checkCollision(int x1, int y1, int w1, int h1, int x2, int y2, int w2, int h2);
     static bool canMoveToPosition(int x, int y, int width, int height, int myId);
+    static void moveEntity(DisplayObject& entity, int targetX, int targetY, int step, int delayMs);
 };
