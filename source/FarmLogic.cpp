@@ -19,6 +19,8 @@ std::mutex FarmLogic::_nestMutexes[3];
 std::condition_variable FarmLogic::_nestCVs[3];
 int FarmLogic::_nestEggCounts[3] = {0, 0, 0};
 bool FarmLogic::_chickenOnNest[3] = {false, false, false};
+std::array<std::array<int, 3>, 3> FarmLogic::_nestEggIds = {{{0, 0, 0}, {0, 0, 0}, {0, 0, 0}}};
+std::atomic<int> FarmLogic::_nextEggId{1000};
 
 std::mutex FarmLogic::_bakeryStorageMutex;
 std::condition_variable FarmLogic::_bakeryStorageCV;
@@ -47,7 +49,8 @@ std::mutex FarmLogic::_positionMutex;
 std::mutex FarmLogic::_shopMutex;
 
 // Constants for positions
-const int NEST_POSITIONS[3][2] = {{150, 500}, {400, 500}, {650, 500}};
+const int NEST_POSITIONS[3][2] = {{300, 140}, {400, 80}, {500, 140}};
+const int CHICKEN_WAIT_POSITIONS[3][2] = {{400, 260}, {440, 300}, {360, 300}};
 const int BARN1_X = 100;
 const int BARN1_Y = 100;
 const int BARN2_X = 100;
@@ -56,6 +59,8 @@ const int BAKERY_X = 650;
 const int BAKERY_Y = 150;
 const int INTERSECTION_X = 400;
 const int INTERSECTION_Y = 200;
+const int FARMER_REST_X = BARN1_X;
+const int FARMER_REST_Y = BARN1_Y + 80;
 
 // Helper function to check collision between two rectangles
 bool FarmLogic::checkCollision(int x1, int y1, int w1, int h1, int x2, int y2, int w2, int h2) {
@@ -73,8 +78,8 @@ bool FarmLogic::canMoveToPosition(int x, int y, int width, int height, int myId)
     std::lock_guard<std::mutex> lock(_positionMutex);
     for (const auto& pair : DisplayObject::theFarm) {
         if (pair.second.id != myId && pair.second.layer == 2) {
-            if (checkCollision(x, y, width, height, 
-                             pair.second.x, pair.second.y, 
+            if (checkCollision(x, y, width, height,
+                             pair.second.x, pair.second.y,
                              pair.second.width, pair.second.height)) {
                 return false;
             }
@@ -83,16 +88,42 @@ bool FarmLogic::canMoveToPosition(int x, int y, int width, int height, int myId)
     return true;
 }
 
+void FarmLogic::moveEntity(DisplayObject& entity, int targetX, int targetY, int step, int delayMs) {
+    while (_running && entity.x != targetX) {
+        int diff = targetX - entity.x;
+        int delta = (std::abs(diff) < step) ? diff : (diff > 0 ? step : -step);
+        int newX = entity.x + delta;
+        if (canMoveToPosition(newX, entity.y, entity.width, entity.height, entity.id)) {
+            entity.setPos(newX, entity.y);
+            {
+                std::lock_guard<std::mutex> lock(_farmDisplayMutex);
+                entity.updateFarm();
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+    }
+
+    while (_running && entity.y != targetY) {
+        int diff = targetY - entity.y;
+        int delta = (std::abs(diff) < step) ? diff : (diff > 0 ? step : -step);
+        int newY = entity.y + delta;
+        if (canMoveToPosition(entity.x, newY, entity.width, entity.height, entity.id)) {
+            entity.setPos(entity.x, newY);
+            {
+                std::lock_guard<std::mutex> lock(_farmDisplayMutex);
+                entity.updateFarm();
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+    }
+}
+
 // Chicken thread - walks between nests and lays eggs
 void FarmLogic::chickenThread(int chickenId) {
-    std::random_device rd;
-    std::mt19937 gen(rd() + chickenId);
-    std::uniform_int_distribution<> nestDist(0, 2);
-    std::uniform_int_distribution<> eggDist(1, 2);
-    
     DisplayObject chicken("chicken", 60, 60, 2, 100 + chickenId);
-    chicken.setPos(200 + chickenId * 100, 0);
-    
+    int targetNest = chickenId % 3;
+    chicken.setPos(NEST_POSITIONS[targetNest][0], NEST_POSITIONS[targetNest][1]);
+
     {
         std::lock_guard<std::mutex> lock(_farmDisplayMutex);
         chicken.updateFarm();
@@ -322,10 +353,9 @@ void FarmLogic::chickenThread(int chickenId) {
 
             // Update barn eggs
             {
-                std::lock_guard<std::mutex> barnLock(_barnEggMutex);
-                _barnEggs++;
-                DisplayObject::stats.eggs_laid++;
-                _barnEggCV.notify_all();
+                std::lock_guard<std::mutex> nestLock(_nestMutexes[targetNest]);
+                _nestEggIds[targetNest][eggIndex] = eggId;
+                _nestEggCounts[targetNest] = eggIndex + 1;
             }
 
             // Display egg
@@ -333,8 +363,8 @@ void FarmLogic::chickenThread(int chickenId) {
             egg.setPos(NEST_POSITIONS[targetNest][0] + (_nestEggCounts[targetNest] - 1) * 15 - 15,
                       NEST_POSITIONS[targetNest][1] + 7);
             {
-                std::lock_guard<std::mutex> lock(_farmDisplayMutex);
-                egg.updateFarm();
+                std::lock_guard<std::mutex> statsLock(_barnEggMutex);
+                DisplayObject::stats.eggs_laid++;
             }
         }
 
@@ -388,13 +418,13 @@ void FarmLogic::chickenThread(int chickenId) {
 // Cow thread - just stands around
 void FarmLogic::cowThread(int cowId) {
     DisplayObject cow("cow", 60, 60, 2, 300 + cowId);
-    cow.setPos(250 + cowId * 80, 350);
-    
+    cow.setPos(700 + cowId * 40, 450);
+
     {
         std::lock_guard<std::mutex> lock(_farmDisplayMutex);
         cow.updateFarm();
     }
-    
+
     while (_running) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     }
@@ -402,12 +432,9 @@ void FarmLogic::cowThread(int cowId) {
 
 // Farmer thread - collects eggs from nests
 void FarmLogic::farmerThread() {
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    
     DisplayObject farmer("farmer", 30, 60, 2, 400);
-    farmer.setPos(200, 400);
-    
+    farmer.setPos(FARMER_REST_X, FARMER_REST_Y);
+
     {
         std::lock_guard<std::mutex> lock(_farmDisplayMutex);
         farmer.updateFarm();
@@ -509,16 +536,17 @@ void FarmLogic::farmerThread() {
             _nestCVs[nestIdx].wait(nestLock, [nestIdx]() {
                 return !_chickenOnNest[nestIdx];
             });
-            
-            if (_nestEggCounts[nestIdx] > 0) {
-                // Remove eggs from display
-                for (int i = 0; i < _nestEggCounts[nestIdx]; i++) {
-                    DisplayObject egg("egg", 10, 20, 1, 200 + nestIdx * 10 + i + 1);
-                    {
-                        std::lock_guard<std::mutex> lock(_farmDisplayMutex);
-                        egg.erase();
-                    }
-                }
+            if (!_running) {
+                return;
+            }
+            waitLock.unlock();
+
+            moveEntity(farmer, NEST_POSITIONS[nestIdx][0], NEST_POSITIONS[nestIdx][1] - 70, stepSize, 60);
+
+            std::array<int, 3> eggsToCollect{};
+            {
+                std::lock_guard<std::mutex> collectLock(_nestMutexes[nestIdx]);
+                eggsToCollect = _nestEggIds[nestIdx];
                 _nestEggCounts[nestIdx] = 0;
                 collectionsCount++;
                 if (collectionsCount >= 3) {
@@ -593,27 +621,19 @@ void FarmLogic::farmerThread() {
                         std::lock_guard<std::mutex> lock(_farmDisplayMutex);
                         farmer.updateFarm();
                     }
-                    moved = true;
-                } else {
-                    // COLLISION DETECTED
-                    isCollided = true;
-                    collisionTurnsRemaining = 20;
                 }
-                
-                if (moved && farmer.x != lastX && farmer.y != lastY) {
-                    isCollided = false;
-                    collisionTurnsRemaining = 0;
-                }
-                
-                lastX = farmer.x;
-                lastY = farmer.y;
-                
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                farmer.updateFarm();
             }
-            
-            // Drop off eggs at barn (brief pause to simulate drop-off)
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            collectionsCount = 0;
+
+            if (collected > 0) {
+                std::lock_guard<std::mutex> barnLock(_barnEggMutex);
+                DisplayObject::stats.eggs_used += collected;
+            }
+
+            _nestCVs[nestIdx].notify_all();
+
+            moveEntity(farmer, FARMER_REST_X, FARMER_REST_Y, stepSize, 60);
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
     }
 }
@@ -943,6 +963,15 @@ void FarmLogic::redisplayThread() {
 void FarmLogic::run() {
     std::srand(std::time(0));
     _running = true;
+    _workers.clear();
+
+    for (int i = 0; i < 3; ++i) {
+        _nestEggCounts[i] = 0;
+        _chickenOnNest[i] = false;
+        _nestEggIds[i].fill(0);
+    }
+    _nextEggId.store(1000);
+    _barnEggs = 0;
     
     // Create static farm objects (layer 0 - stationary)
     DisplayObject barn1("barn", 100, 100, 0, 10);
@@ -990,20 +1019,6 @@ void FarmLogic::run() {
     
     // Start farmer
     _workers.push_back(std::thread(farmerThread));
-    
-    // Start 2 trucks (one for eggs/butter, one for flour/sugar)
-    _workers.push_back(std::thread(truckThread, 0, true));  // Egg truck
-    _workers.push_back(std::thread(truckThread, 1, false)); // Flour/sugar truck
-    
-    // Start oven
-    _workers.push_back(std::thread(ovenThread));
-    
-    // Start 5 children
-    _workers.push_back(std::thread(childThread, 0));
-    _workers.push_back(std::thread(childThread, 1));
-    _workers.push_back(std::thread(childThread, 2));
-    _workers.push_back(std::thread(childThread, 3));
-    _workers.push_back(std::thread(childThread, 4));
     
     // Wait for all threads
     for (auto& worker : _workers) {
