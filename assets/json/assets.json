@@ -1,0 +1,50 @@
+{
+	"textures": {
+		"chicken": {
+			"file":     "textures/chicken.png"
+		},
+		"nest": {
+			"file":     "textures/nest.png"
+		},
+		"egg": {
+			"file":     "textures/egg.png"
+		},
+		"barn": {
+			"file":     "textures/barn.png"
+		},
+		"truck": {
+			"file":     "textures/truck.png"
+		},
+		"cow": {
+			"file":     "textures/cow.png"
+		},
+		"farmer": {
+			"file":     "textures/farmer.png"
+		},
+		"child": {
+			"file":     "textures/child.png"
+		},
+		"bakery": {
+			"file":     "textures/bakery.png"
+		},
+		"cake": {
+			"file":     "textures/cake.png"
+		},
+		"flour": {
+			"file":     "textures/flour.png"
+		},
+		"butter": {
+			"file":     "textures/butter.png"
+		},
+		"sugar": {
+			"file":     "textures/sugar.png"
+		}
+	},
+    "fonts": {
+        "roboto": {
+            "file":     "fonts/Roboto-Regular.ttf",
+            "size":     64
+        }
+    }
+
+}

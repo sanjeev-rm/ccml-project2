@@ -1,0 +1,1 @@
+cd build/cmake/cmake/install && SDL_AUDIODRIVER=dummy ./Farmville.exe
