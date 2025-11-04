@@ -1,0 +1,131 @@
+THREAD SAFETY REPORT - FARMVILLE PART 2
+
+==================================
+SYNCHRONIZATION DESIGN OVERVIEW
+==================================
+
+This implementation uses a monitor-style synchronization approach with mutexes and condition variables to coordinate all farm activities while preventing race conditions and ensuring proper sequencing of events.
+
+==================================
+KEY SYNCHRONIZATION MECHANISMS
+==================================
+
+1. FARM DISPLAY MUTEX (_farmDisplayMutex)
+   Purpose: Protects updateFarm(), erase(), and redisplay() operations
+   Scope: Narrowly scoped - acquired only when actually updating the shared farm map
+   Pattern: Simple mutual exclusion
+   
+   Design Decision: This is the only synchronization required from Part 1. All threads that modify the visual representation must serialize access to the shared farm state map. The lock is held only during the actual map update, not during position calculations or movement logic.
+
+2. NEST SYNCHRONIZATION (3 separate mutexes + CVs)
+   _nestMutexes[3]: One mutex per nest
+   _nestCVs[3]: One condition variable per nest
+   _nestEggCounts[3]: Tracks eggs in each nest (max 3)
+   _chickenOnNest[3]: Prevents farmer from collecting while chicken is laying
+   
+   Design Decision: Each nest has independent synchronization to allow maximum parallelism. Multiple chickens can simultaneously work with different nests. Chickens wait for:
+   - Nest to have space (< 3 eggs)
+   - No other chicken currently on nest
+   
+   Farmer waits for:
+   - No chicken on nest before collecting
+   
+   This prevents: Nest overflow (> 3 eggs), concurrent access conflicts
+
+3. BAKERY STORAGE SYNCHRONIZATION
+   _bakeryStorageMutex + _bakeryStorageCV
+   Tracks: _bakeryEggs, _bakeryButter, _bakeryFlour, _bakerySugar (max 6 each)
+   
+   Design Decision: Single mutex for all storage items because they're logically grouped and the oven needs atomic access to all four ingredient counts. Trucks wait for space before unloading. Oven waits for sufficient ingredients (≥2 of each).
+   
+   Reader/Writer Pattern: Multiple threads can read counts, but updates are serialized. Condition variable enables efficient waiting instead of busy-waiting.
+
+4. BAKERY STOCK SYNCHRONIZATION  
+   _bakeryStockMutex + _bakeryStockCV
+   Tracks: _bakeryCakes (max 6)
+   
+   Design Decision: Separate from storage because cakes and ingredients have different access patterns. Oven waits for space (≤3) before baking. Children wait for sufficient cakes to fulfill their order. Only one child can be in shop at a time (enforced by _shopMutex).
+
+5. OVEN SYNCHRONIZATION
+   _ovenMutex + _ovenCV
+   _ovenBusy: Boolean flag
+   
+   Design Decision: The oven is a single resource that can only bake one batch at a time. Uses a simple busy flag with condition variable. The oven thread coordinates with both storage (taking ingredients) and stock (adding cakes) mutexes separately to avoid nested lock acquisition and potential deadlock.
+
+6. BARN EGG PRODUCTION
+   _barnEggMutex + _barnEggCV
+   _barnEggs: Accumulates eggs laid by chickens
+   
+   Design Decision: Decouples chicken egg-laying from truck pickup. Chickens increment the count atomically. Egg truck waits until ≥3 eggs are available. This prevents trucks from taking eggs that haven't been produced yet.
+
+7. TRUCK INTERSECTION SYNCHRONIZATION
+   _intersectionMutex + _intersectionCV
+   _intersectionOccupied: Boolean flag
+   
+   Design Decision: Implements first-come-first-served fairness for intersection crossing. Whichever truck arrives first acquires the intersection lock and crosses. The other truck waits via condition variable. This prevents deadlock (both trucks blocking each other) and ensures dynamic coordination based on timing, not rigid priority.
+
+8. POSITION SYNCHRONIZATION
+   _positionMutex
+   
+   Design Decision: Protects collision detection for layer 2 (moving) objects. Before any moving entity updates its position, it checks for collisions with all other layer 2 objects. This is a reader-pattern lock - it reads the shared farm map to check all positions. This prevents chickens, children, trucks, and the farmer from walking through each other.
+
+9. SHOP SYNCHRONIZATION
+   _shopMutex
+   
+   Design Decision: Simple mutual exclusion ensuring only one child can be inside the bakery shop at a time. Child holds this lock while waiting for cakes to be ready, ensuring they get their full order before the next child enters.
+
+==================================
+AVOIDING DEADLOCK
+==================================
+
+Lock Ordering: When multiple locks are needed, they're acquired in a consistent order:
+1. Never hold position lock while acquiring other locks
+2. Storage/stock locks are never held simultaneously with nest locks
+3. Farm display lock is always acquired last (just for the update)
+
+Lock Granularity: Each lock protects a minimal critical section. Position calculations happen outside locks; only the actual update is protected.
+
+Condition Variables: Instead of busy-waiting or nested locking, threads wait on condition variables and are notified when state changes.
+
+==================================
+MEETING PART 2 REQUIREMENTS
+==================================
+
+1. ✓ Chickens coordinate to avoid collisions (canMoveToPosition + _positionMutex)
+2. ✓ Multiple chickens contend for same nest (wait on _nestCVs)
+3. ✓ Nests have eggs from multiple chickens (independent chicken threads)
+4. ✓ Maximum 3 eggs per nest enforced (_nestEggCounts < 3 check)
+5. ✓ Farmer can't collect while chicken on nest (_chickenOnNest flag)
+6. ✓ Trucks wait for actual egg production (_barnEggCV wait)
+7. ✓ Dynamic truck intersection coordination (FCFS via _intersectionCV)
+8. ✓ Children wait for sufficient cakes (_bakeryStockCV wait)
+9. ✓ Children can't walk over each other (canMoveToPosition check)
+
+==================================
+PERFORMANCE CONSIDERATIONS
+==================================
+
+- Independent locks for nests allow parallel chicken activity
+- Separate storage/stock locks allow oven to work independently from trucks
+- Position checking only locks briefly during collision detection
+- Redisplay runs in its own thread at consistent 10 FPS
+- Condition variables prevent busy-waiting, reducing CPU usage
+
+==================================
+TESTING APPROACH
+==================================
+
+The simulation should be run and observed for:
+1. No more than 3 eggs ever appear in a nest
+2. Chickens move between nests after laying 3 eggs
+3. No layer-2 objects overlap
+4. Trucks coordinate at intersection (not simultaneous)
+5. Only one child at shop entrance at a time
+6. Stats show no lost products (eggs_laid ≈ eggs_used over time)
+7. No deadlocks or hangs occur
+
+==================================
+CONCLUSION
+==================================
+
+This implementation uses appropriate synchronization primitives (mutexes for mutual exclusion, condition variables for waiting on state changes) applied with narrow scopes to maximize concurrency while ensuring correctness. The design follows monitor patterns, avoids deadlock through careful lock ordering, and satisfies all Part 2 requirements.
