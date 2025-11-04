@@ -192,11 +192,6 @@ void FarmLogic::chickenThread(int chickenId) {
         int targetX = NEST_POSITIONS[targetNest][0];
         int targetY = NEST_POSITIONS[targetNest][1];
 
-        int initialDistance = std::max(1, std::abs(chicken.x - targetX) + std::abs(chicken.y - targetY));
-        int stuckSteps = 0;
-        int maxStuckSteps = std::clamp(initialDistance * 4, 200, 1500);
-        bool retargetCurrentNest = false;
-
         while (std::abs(chicken.x - targetX) > 5 || std::abs(chicken.y - targetY) > 5) {
             if (performCollisionStep(std::chrono::milliseconds(50))) {
                 continue;
@@ -250,18 +245,10 @@ void FarmLogic::chickenThread(int chickenId) {
                 }
             }
 
-            // Try to move; if blocked, try just x or just y movement
             if (!moved) {
                 if (startCollisionAvoidance()) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(50));
                     continue;
-                }
-
-                stuckSteps++;
-
-                if (stuckSteps >= maxStuckSteps) {
-                    retargetCurrentNest = true;
-                    break;
                 }
 
                 int randomOffsetX = (gen() % 40) - 20;
@@ -282,36 +269,9 @@ void FarmLogic::chickenThread(int chickenId) {
             } else {
                 isCollided = false;
                 collisionMovesRemaining = 0;
-                stuckSteps = 0;
             }
 
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
-
-        if (retargetCurrentNest) {
-            int escapeX = chicken.x + ((gen() % 2) ? 100 : -100);
-            int escapeY = chicken.y + ((gen() % 2) ? 80 : -80);
-            escapeX = std::max(50, std::min(750, escapeX));
-            escapeY = std::max(50, std::min(550, escapeY));
-
-            for (int attempt = 0; attempt < 6; attempt++) {
-                if (canMoveToPosition(escapeX, escapeY, chicken.width, chicken.height, chicken.id)) {
-                    chicken.setPos(escapeX, escapeY);
-                    {
-                        std::lock_guard<std::mutex> lock(_farmDisplayMutex);
-                        chicken.updateFarm();
-                    }
-                    break;
-                }
-                escapeX += (gen() % 40) - 20;
-                escapeY += (gen() % 40) - 20;
-                escapeX = std::max(50, std::min(750, escapeX));
-                escapeY = std::max(50, std::min(550, escapeY));
-            }
-
-            nextNest = pickDifferentNest(targetNest);
-            std::this_thread::sleep_for(std::chrono::milliseconds(150));
-            continue;
         }
 
         // Check if nest is available (NO WAITING - immediate check)
